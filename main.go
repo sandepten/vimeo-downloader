@@ -14,8 +14,20 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
+
+// Global HTTP client with connection pooling for better performance
+var httpClient = &http.Client{
+	Timeout: 120 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 100,
+		MaxConnsPerHost:     100,
+		IdleConnTimeout:     90 * time.Second,
+	},
+}
 
 // Playlist represents the Vimeo playlist.json structure
 type Playlist struct {
@@ -70,7 +82,7 @@ func main() {
 	playlistURL := flag.String("url", "", "Playlist JSON URL")
 	playlistFile := flag.String("file", "", "Local playlist JSON file")
 	outputFile := flag.String("o", "output.mp4", "Output filename")
-	concurrent := flag.Int("c", 8, "Number of concurrent downloads")
+	concurrent := flag.Int("c", 16, "Number of concurrent downloads per stream")
 	listOnly := flag.Bool("list", false, "List available streams without downloading")
 	videoQuality := flag.String("quality", "best", "Video quality: best, worst, or resolution like 1080, 720, 360")
 	flag.Parse()
@@ -87,7 +99,7 @@ func main() {
 		fmt.Println("  -url string      Playlist JSON URL from Vimeo")
 		fmt.Println("  -file string     Local playlist JSON file (requires -url for base URL)")
 		fmt.Println("  -o string        Output filename (default: output.mp4)")
-		fmt.Println("  -c int           Number of concurrent downloads (default: 8)")
+		fmt.Println("  -c int           Number of concurrent downloads per stream (default: 16)")
 		fmt.Println("  -quality string  Video quality: best, worst, or resolution (default: best)")
 		fmt.Println("  -list            List available streams without downloading")
 		fmt.Println()
@@ -199,21 +211,63 @@ func main() {
 	}
 	defer os.RemoveAll(tempDir)
 
-	// Download video stream
-	fmt.Println("\nDownloading video...")
 	videoFile := filepath.Join(tempDir, "video.mp4")
-	err = downloadStreamSegments(selectedVideo, baseURLPrefix, videoFile, *concurrent)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error downloading video: %v\n", err)
+	audioFile := filepath.Join(tempDir, "audio.mp4")
+
+	// Download video and audio streams IN PARALLEL
+	fmt.Println("\nDownloading video and audio in parallel...")
+
+	var wg sync.WaitGroup
+	var videoErr, audioErr error
+
+	// Progress tracking for both streams
+	var videoCompleted, audioCompleted int64
+	videoTotal := len(selectedVideo.Segments)
+	audioTotal := len(selectedAudio.Segments)
+
+	// Start video download goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		videoErr = downloadStreamSegments(selectedVideo, baseURLPrefix, videoFile, *concurrent, &videoCompleted)
+	}()
+
+	// Start audio download goroutine
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		audioErr = downloadStreamSegments(selectedAudio, baseURLPrefix, audioFile, *concurrent, &audioCompleted)
+	}()
+
+	// Progress reporter goroutine
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				vc := atomic.LoadInt64(&videoCompleted)
+				ac := atomic.LoadInt64(&audioCompleted)
+				fmt.Printf("\r  Video: %d/%d (%.1f%%) | Audio: %d/%d (%.1f%%)     ",
+					vc, videoTotal, float64(vc)/float64(videoTotal)*100,
+					ac, audioTotal, float64(ac)/float64(audioTotal)*100)
+			}
+		}
+	}()
+
+	wg.Wait()
+	close(done)
+	fmt.Println() // New line after progress
+
+	if videoErr != nil {
+		fmt.Fprintf(os.Stderr, "Error downloading video: %v\n", videoErr)
 		os.Exit(1)
 	}
-
-	// Download audio stream
-	fmt.Println("\nDownloading audio...")
-	audioFile := filepath.Join(tempDir, "audio.mp4")
-	err = downloadStreamSegments(selectedAudio, baseURLPrefix, audioFile, *concurrent)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error downloading audio: %v\n", err)
+	if audioErr != nil {
+		fmt.Fprintf(os.Stderr, "Error downloading audio: %v\n", audioErr)
 		os.Exit(1)
 	}
 
@@ -257,7 +311,6 @@ func getBaseURLPrefix(playlistURL, relativeBase string) string {
 }
 
 func fetchURL(urlStr string) ([]byte, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequest("GET", urlStr, nil)
 	if err != nil {
 		return nil, err
@@ -267,7 +320,7 @@ func fetchURL(urlStr string) ([]byte, error) {
 		req.Header.Set(key, value)
 	}
 
-	resp, err := client.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -280,39 +333,23 @@ func fetchURL(urlStr string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-func downloadStreamSegments(stream *Stream, baseURLPrefix, outputFile string, concurrent int) error {
-	tempDir := filepath.Dir(outputFile)
-
-	// Create output file
-	out, err := os.Create(outputFile)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-
+func downloadStreamSegments(stream *Stream, baseURLPrefix, outputFile string, concurrent int, completedCounter *int64) error {
 	// Write init segment first (it's base64 encoded)
+	var initData []byte
 	if stream.InitSegment != "" {
-		initData, err := base64.StdEncoding.DecodeString(stream.InitSegment)
+		var err error
+		initData, err = base64.StdEncoding.DecodeString(stream.InitSegment)
 		if err != nil {
 			return fmt.Errorf("failed to decode init segment: %w", err)
 		}
-		if _, err := out.Write(initData); err != nil {
-			return fmt.Errorf("failed to write init segment: %w", err)
-		}
-		fmt.Printf("  Wrote init segment (%d bytes)\n", len(initData))
 	}
 
-	// Download all segments to temp files
-	segmentFiles := make([]string, len(stream.Segments))
+	// Download all segments concurrently and store in memory
+	segmentData := make([][]byte, len(stream.Segments))
 	sem := make(chan struct{}, concurrent)
 	var wg sync.WaitGroup
 	var downloadErr error
 	var errMutex sync.Mutex
-
-	// Progress tracking
-	var completed int64
-	var progressMutex sync.Mutex
-	total := len(stream.Segments)
 
 	for i, segment := range stream.Segments {
 		wg.Add(1)
@@ -322,13 +359,20 @@ func downloadStreamSegments(stream *Stream, baseURLPrefix, outputFile string, co
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			segFile := filepath.Join(tempDir, fmt.Sprintf("seg_%05d.tmp", idx))
-			segmentFiles[idx] = segFile
-
 			// Construct full URL
 			fullURL := baseURLPrefix + seg.URL
 
-			err := downloadToFile(fullURL, segFile)
+			// Download with retry
+			var data []byte
+			var err error
+			for retries := 0; retries < 3; retries++ {
+				data, err = downloadToMemory(fullURL)
+				if err == nil {
+					break
+				}
+				time.Sleep(time.Duration(retries+1) * 500 * time.Millisecond)
+			}
+
 			if err != nil {
 				errMutex.Lock()
 				if downloadErr == nil {
@@ -338,66 +382,62 @@ func downloadStreamSegments(stream *Stream, baseURLPrefix, outputFile string, co
 				return
 			}
 
-			progressMutex.Lock()
-			completed++
-			fmt.Printf("\r  Progress: %d/%d segments (%.1f%%)", completed, total, float64(completed)/float64(total)*100)
-			progressMutex.Unlock()
+			segmentData[idx] = data
+			atomic.AddInt64(completedCounter, 1)
 		}(i, segment)
 	}
 
 	wg.Wait()
-	fmt.Println()
 
 	if downloadErr != nil {
 		return downloadErr
 	}
 
-	// Concatenate segments in order
-	fmt.Printf("  Concatenating %d segments...\n", len(segmentFiles))
-	for _, segFile := range segmentFiles {
-		data, err := os.ReadFile(segFile)
-		if err != nil {
-			return fmt.Errorf("failed to read segment: %w", err)
-		}
-		if _, err := out.Write(data); err != nil {
-			return fmt.Errorf("failed to write segment: %w", err)
-		}
-		os.Remove(segFile) // Clean up as we go
-	}
-
-	return nil
-}
-
-func downloadToFile(urlStr, outputFile string) error {
-	client := &http.Client{Timeout: 60 * time.Second}
-
-	req, err := http.NewRequest("GET", urlStr, nil)
-	if err != nil {
-		return err
-	}
-
-	for key, value := range defaultHeaders {
-		req.Header.Set(key, value)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
-	}
-
+	// Write everything to output file
 	out, err := os.Create(outputFile)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
 
-	_, err = io.Copy(out, resp.Body)
-	return err
+	// Write init segment
+	if len(initData) > 0 {
+		if _, err := out.Write(initData); err != nil {
+			return fmt.Errorf("failed to write init segment: %w", err)
+		}
+	}
+
+	// Write all segments in order
+	for _, data := range segmentData {
+		if _, err := out.Write(data); err != nil {
+			return fmt.Errorf("failed to write segment: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func downloadToMemory(urlStr string) ([]byte, error) {
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	for key, value := range defaultHeaders {
+		req.Header.Set(key, value)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+
+	return io.ReadAll(resp.Body)
 }
 
 func muxStreams(videoFile, audioFile, outputFile string) error {
